@@ -6,6 +6,7 @@ use petal_neighbors::{
     BallTree,
 };
 use rayon::prelude::*;
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::ops::{AddAssign, DivAssign};
 
@@ -72,9 +73,9 @@ where
         let neighborhoods =
             build_neighborhoods(&input, self.eps, self.metric.clone(), self.chunk_size);
 
-        let mut visited = FixedBitSet::with_capacity(input.nrows());
+        let mut visited = RoaringBitmap::new();
         for (idx, neighbors) in neighborhoods.iter().enumerate() {
-            if visited[idx] || neighbors.len() < self.min_samples {
+            if visited.contains(idx as u32) || (neighbors.len() as usize) < self.min_samples {
                 continue;
             }
 
@@ -104,32 +105,36 @@ fn build_neighborhoods<S, A, M>(
     eps: A,
     metric: M,
     chunk_size: usize,
-) -> Vec<FixedBitSet>
+) -> Vec<RoaringBitmap>
 where
     A: AddAssign + DivAssign + FloatCore + FromPrimitive + Sync,
-    S: Data<Elem = A>,
+    S: Data<Elem = A> + Sync,
     M: Metric<A> + Sync,
 {
     let nrows = input.nrows();
     if nrows == 0 {
         return Vec::new();
     }
-    let mut results: Vec<FixedBitSet> = Vec::with_capacity(nrows);
+    let mut results: Vec<RoaringBitmap> = Vec::with_capacity(nrows);
     let db = BallTree::new(input, metric).expect("non-empty array");
 
-    for chunk in input.axis_chunks_iter(Axis(0), chunk_size) {
-        let rows: Vec<_> = chunk.rows().into_iter().collect();
-        let chunk_results: Vec<FixedBitSet> = rows
-            .into_par_iter()
-            .map(|p| {
-                let mut bitset = FixedBitSet::with_capacity(nrows);
-                for i in db.query_radius(&p, eps) {
-                    bitset.set(i, true);
-                }
-                bitset
-            })
-            .collect();
-        results.extend(chunk_results);
+    for start in (0..nrows).step_by(chunk_size) {
+        let end = (start + chunk_size).min(nrows);
+        {
+            let chunk_results: Vec<_> = (start..end)
+                .into_par_iter()
+                .map(|i| {
+                    let row = input.row(i);
+                    let mut bitmap = RoaringBitmap::new();
+
+                    for j in db.query_radius(&row, eps) {
+                        bitmap.insert(j as u32);
+                    }
+                    bitmap
+                })
+                .collect();
+            results.extend(chunk_results);
+        }
     }
 
     results
@@ -137,33 +142,35 @@ where
 
 fn expand_cluster(
     cluster: &mut Vec<usize>,
-    visited: &mut FixedBitSet,
+    visited: &mut RoaringBitmap,
     idx: usize,
     min_samples: usize,
-    neighborhoods: &[FixedBitSet],
+    neighborhoods: &[RoaringBitmap],
 ) {
-    let mut to_visit = FixedBitSet::with_capacity(visited.len());
-    to_visit.set(idx, true); // Start with initial index
+    let mut to_visit = RoaringBitmap::new();
+    // Add initial point
+    to_visit.insert(idx as u32);
 
-    while to_visit.count_ones(..) > 0 {
-        // Get next point to process (any set bit)
-        let cur = to_visit.ones().next().unwrap();
+    // While there remain points to visit
+    while to_visit.len() > 0 {
+        // Get next point to process (first in the to_visit list)
+        let cur = to_visit.iter().next().unwrap() as usize;
 
         // Mark as visited and remove from to_visit
-        visited.set(cur, true);
-        to_visit.set(cur, false);
+        visited.insert(cur as u32);
+        to_visit.remove(cur as u32);
         cluster.push(cur);
 
         // If core point, add its unvisited neighbors
-        if neighborhoods[cur].count_ones(..) >= min_samples {
-            // Create temporary bitset of new neighbors
-            let mut new_neighbors = neighborhoods[cur].clone();
-            // Remove already visited points
-            new_neighbors.difference_with(visited);
-            // Remove points already in to_visit to avoid duplicates
-            new_neighbors.difference_with(&to_visit);
-            // Union with to_visit to add new points to check
-            to_visit.union_with(&new_neighbors);
+        if neighborhoods[cur].len() as usize >= min_samples {
+            // for each neighbor in the current neighborhood
+            for neighbor in neighborhoods[cur].iter() {
+                // if the neighbor has not already been visited and is not still in the to_visit
+                // list, add it to the to_visit queue
+                if !visited.contains(neighbor) && !to_visit.contains(neighbor) {
+                    to_visit.insert(neighbor);
+                }
+            }
         }
     }
 }
