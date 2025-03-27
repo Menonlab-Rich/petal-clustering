@@ -1,7 +1,5 @@
-use std::collections::{HashMap, HashSet};
-use std::ops::{AddAssign, DivAssign};
-
-use ndarray::{ArrayBase, Data, Ix2};
+use fixedbitset::FixedBitSet;
+use ndarray::{ArrayBase, Axis, Data, Ix2};
 use num_traits::{float::FloatCore, FromPrimitive};
 use petal_neighbors::{
     distance::{Euclidean, Metric},
@@ -9,27 +7,11 @@ use petal_neighbors::{
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::ops::{AddAssign, DivAssign};
 
 use super::Fit;
 
-/// DBSCAN (density-based spatial clustering of applications with noise)
-/// clustering algorithm.
-///
-/// # Examples
-///
-/// ```
-/// use ndarray::array;
-/// use petal_neighbors::distance::Euclidean;
-/// use petal_clustering::{Dbscan, Fit};
-///
-/// let points = array![[1., 2.], [2., 2.], [2., 2.3], [8., 7.], [8., 8.], [25., 80.]];
-/// let clustering = Dbscan::new(3., 2, Euclidean::default()).fit(&points);
-///
-/// assert_eq!(clustering.0.len(), 2);        // two clusters found
-/// assert_eq!(clustering.0[&0], [0, 1, 2]);  // the first three points in Cluster 0
-/// assert_eq!(clustering.0[&1], [3, 4]);     // [8., 7.] and [8., 8.] in Cluster 1
-/// assert_eq!(clustering.1, [5]);            // [25., 80.] doesn't belong to any cluster
-/// ```
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Dbscan<A, M> {
     /// The radius of a neighborhood.
@@ -65,29 +47,28 @@ impl<A, M> Dbscan<A, M> {
     }
 }
 
-impl<S, A, M> Fit<ArrayBase<S, Ix2>, (HashMap<usize, Vec<usize>>, Vec<usize>)> for Dbscan<A, M>
+impl<S, A, M> Fit<ArrayBase<S, Ix2>, Vec<i32>> for Dbscan<A, M>
 where
     A: AddAssign + DivAssign + FloatCore + FromPrimitive + Sync,
     S: Data<Elem = A>,
     M: Metric<A> + Clone + Sync,
 {
-    fn fit(&mut self, input: &ArrayBase<S, Ix2>) -> (HashMap<usize, Vec<usize>>, Vec<usize>) {
+    fn fit(&mut self, input: &ArrayBase<S, Ix2>) -> Vec<i32> {
         // `BallTree` does not accept an empty input.
+        let mut labels = vec![-1; input.nrows()];
+        let mut cid = 0;
         if input.is_empty() {
-            return (HashMap::new(), Vec::new());
+            return labels;
         }
 
         let input = input.as_standard_layout();
         let neighborhoods = build_neighborhoods(&input, self.eps, self.metric.clone());
 
-        let mut visited = vec![false; input.nrows()];
-        let mut clusters = HashMap::new();
+        let mut visited = FixedBitSet::with_capacity(input.nrows());
         for (idx, neighbors) in neighborhoods.iter().enumerate() {
             if visited[idx] || neighbors.len() < self.min_samples {
                 continue;
             }
-
-            let cid = clusters.len();
 
             let mut cluster = Vec::new();
             expand_cluster(
@@ -98,51 +79,78 @@ where
                 &neighborhoods,
             );
             if cluster.len() >= self.min_samples {
-                clusters.insert(cid, cluster);
+                for pt in cluster {
+                    labels[pt] = cid
+                }
+
+                cid += 1; // increment the cluster id
             }
         }
 
-        let in_cluster: HashSet<usize> = clusters.values().flatten().copied().collect();
-        let outliers = (0..input.nrows())
-            .filter(|x| !in_cluster.contains(x))
-            .collect();
-
-        (clusters, outliers)
+        labels
     }
 }
 
-fn build_neighborhoods<S, A, M>(input: &ArrayBase<S, Ix2>, eps: A, metric: M) -> Vec<Vec<usize>>
+fn build_neighborhoods<S, A, M>(input: &ArrayBase<S, Ix2>, eps: A, metric: M) -> Vec<FixedBitSet>
 where
     A: AddAssign + DivAssign + FloatCore + FromPrimitive + Sync,
     S: Data<Elem = A>,
     M: Metric<A> + Sync,
 {
-    if input.nrows() == 0 {
+    let nrows = input.nrows();
+    if nrows == 0 {
         return Vec::new();
     }
-    let rows: Vec<_> = input.rows().into_iter().collect();
+    let mut results: Vec<FixedBitSet> = Vec::with_capacity(nrows);
     let db = BallTree::new(input, metric).expect("non-empty array");
-    rows.into_par_iter()
-        .map(|p| db.query_radius(&p, eps).into_iter().collect::<Vec<usize>>())
-        .collect()
+
+    for chunk in input.axis_chunks_iter(Axis(0), 10000) {
+        let rows: Vec<_> = chunk.rows().into_iter().collect();
+        let chunk_results: Vec<FixedBitSet> = rows
+            .into_par_iter()
+            .map(|p| {
+                let mut bitset = FixedBitSet::with_capacity(nrows);
+                for i in db.query_radius(&p, eps) {
+                    bitset.set(i, true);
+                }
+                bitset
+            })
+            .collect();
+        results.extend(chunk_results);
+    }
+
+    results
 }
 
 fn expand_cluster(
     cluster: &mut Vec<usize>,
-    visited: &mut [bool],
+    visited: &mut FixedBitSet,
     idx: usize,
     min_samples: usize,
-    neighborhoods: &[Vec<usize>],
+    neighborhoods: &[FixedBitSet],
 ) {
-    let mut to_visit = vec![idx];
-    while let Some(cur) = to_visit.pop() {
-        if visited[cur] {
-            continue;
-        }
-        visited[cur] = true;
+    let mut to_visit = FixedBitSet::with_capacity(visited.len());
+    to_visit.set(idx, true); // Start with initial index
+
+    while to_visit.count_ones(..) > 0 {
+        // Get next point to process (any set bit)
+        let cur = to_visit.ones().next().unwrap();
+
+        // Mark as visited and remove from to_visit
+        visited.set(cur, true);
+        to_visit.set(cur, false);
         cluster.push(cur);
-        if neighborhoods[cur].len() >= min_samples {
-            to_visit.extend(neighborhoods[cur].iter().filter(|&n| !visited[*n]));
+
+        // If core point, add its unvisited neighbors
+        if neighborhoods[cur].count_ones(..) >= min_samples {
+            // Create temporary bitset of new neighbors
+            let mut new_neighbors = neighborhoods[cur].clone();
+            // Remove already visited points
+            new_neighbors.difference_with(visited);
+            // Remove points already in to_visit to avoid duplicates
+            new_neighbors.difference_with(&to_visit);
+            // Union with to_visit to add new points to check
+            to_visit.union_with(&new_neighbors);
         }
     }
 }
@@ -153,6 +161,31 @@ mod test {
     use ndarray::{array, aview2};
 
     use super::*;
+
+    fn labels_to_cluster(labels: &Vec<i32>) -> (HashMap<usize, Vec<usize>>, Vec<usize>) {
+        // Convert the labels vector into clusters HashMap and outliers Vec
+        let mut clusters = HashMap::new();
+        let mut outliers = Vec::new();
+
+        for (idx, &label) in labels.iter().enumerate() {
+            if label == -1 {
+                outliers.push(idx);
+            } else {
+                clusters
+                    .entry(label as usize)
+                    .or_insert_with(Vec::new)
+                    .push(idx);
+            }
+        }
+
+        // Sort for consistent comparison
+        outliers.sort_unstable();
+        for (_, v) in clusters.iter_mut() {
+            v.sort_unstable();
+        }
+
+        (clusters, outliers)
+    }
 
     #[test]
     fn default() {
@@ -173,11 +206,8 @@ mod test {
         ];
 
         let mut model = Dbscan::new(0.5, 2, Euclidean::default());
-        let (mut clusters, mut outliers) = model.fit(&data);
-        outliers.sort_unstable();
-        for (_, v) in clusters.iter_mut() {
-            v.sort_unstable();
-        }
+        let fitted = model.fit(&data);
+        let (clusters, outliers) = labels_to_cluster(&fitted);
 
         assert_eq!(hashmap! {0 => vec![0, 1, 2, 3], 1 => vec![4, 5]}, clusters);
         assert_eq!(Vec::<usize>::new(), outliers);
@@ -187,7 +217,8 @@ mod test {
     fn dbscan_core_samples() {
         let data = array![[0.], [2.], [3.], [4.], [6.], [8.], [10.]];
         let mut model = Dbscan::new(1.01, 1, Euclidean::default());
-        let (clusters, outliers) = model.fit(&data);
+        let fitted = model.fit(&data);
+        let (clusters, outliers) = labels_to_cluster(&fitted);
         assert_eq!(clusters.len(), 5); // {0: [0], 1: [1, 2, 3], 2: [4], 3: [5], 4: [6]}
         assert!(outliers.is_empty());
     }
@@ -198,7 +229,8 @@ mod test {
         let input = aview2(&data);
 
         let mut model = Dbscan::new(0.5, 2, Euclidean::default());
-        let (clusters, outliers) = model.fit(&input);
+        let fitted = model.fit(&input);
+        let (clusters, outliers) = labels_to_cluster(&fitted);
         assert!(clusters.is_empty());
         assert!(outliers.is_empty());
     }
@@ -211,19 +243,13 @@ mod test {
         ];
         let input = data.reversed_axes();
         let mut model = Dbscan::new(0.5, 2, Euclidean::default());
-        let (mut clusters, mut outliers) = model.fit(&input);
-        outliers.sort_unstable();
-        for (_, v) in clusters.iter_mut() {
-            v.sort_unstable();
-        }
+        let fitted = model.fit(&input);
+        let (clusters, outliers) = labels_to_cluster(&fitted);
 
         let input = input.as_standard_layout();
         model = Dbscan::new(0.5, 2, Euclidean::default());
-        let (mut std_clusters, mut std_outliers) = model.fit(&input);
-        std_outliers.sort_unstable();
-        for (_, v) in std_clusters.iter_mut() {
-            v.sort_unstable();
-        }
+        let std_fitted = model.fit(&input);
+        let (std_clusters, std_outliers) = labels_to_cluster(&std_fitted);
 
         assert_eq!(std_clusters, clusters);
         assert_eq!(std_outliers, outliers);
